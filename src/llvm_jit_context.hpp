@@ -58,7 +58,11 @@ class llvm_bpf_jit_context {
 	std::optional<std::unique_ptr<llvm::orc::LLJIT>> jit;
 	llvm::Error do_jit_compile();
 	llvm_bpf_jit_context(llvmbpf_vm &vm);
+	llvm::Error do_jit_compile_with_external_bitcode(
+	    const std::vector<uint8_t> &extra_bitcode,
+	    const std::string &ebpf_func_name);
 	virtual ~llvm_bpf_jit_context();
+	precompiled_ebpf_function get_entry_address(const std::string &name);
 	precompiled_ebpf_function get_entry_address();
 	std::vector<uint8_t> do_aot_compile(bool print_ir = false);
 	llvm::Error load_aot_object(const std::vector<uint8_t> &buf);

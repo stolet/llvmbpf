@@ -70,6 +70,12 @@ class llvmbpf_vm {
 	// return the JITed function if success
 	std::optional<precompiled_ebpf_function> compile() noexcept;
 
+	// Compile with extra LLVM bitcode and return a custom entry symbol
+	std::optional<precompiled_ebpf_function>
+	compile_with_external_bitcode(const std::vector<uint8_t> &extra_bitcode,
+	                              const std::string &entry_symbol,
+	                              const std::string &ebpf_func_symbol = "bpf_main") noexcept;
+
 	// See the spec for details.
 	// If the code involve array map access, the map_val function
 	// needs to be provided.

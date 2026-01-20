@@ -147,7 +147,6 @@
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 // Prefer feature-detection over hardcoding LLVM_VERSION_MAJOR here.
 // These ORC headers (DynamicLibrarySearchGenerator vs ExecutionUtils) moved
-#ifdef BPFTIME_ENABLE_LLVM_PRELOAD
 // between LLVM releases. Using __has_include keeps the code resilient across
 // minor/packaging differences without forcing a specific version guard.
 #if defined(__has_include)
@@ -159,12 +158,9 @@
 #    define BPFTIME_HAVE_ORC_EXECUTIONUTILS 1
 #  endif
 #endif
-#endif
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Error.h>
-#ifdef BPFTIME_ENABLE_LLVM_PRELOAD
 #include <llvm/Support/DynamicLibrary.h>
-#endif
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Transforms/IPO.h>
@@ -292,6 +288,55 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile()
 	this->jit = std::move(jit);
 	return llvm::Error::success();
 }
+llvm::Error llvm_bpf_jit_context::do_jit_compile_with_external_bitcode(
+	const std::vector<uint8_t> &extra_bitcode,
+	const std::string &ebpf_func_name)
+{
+	spin_lock_guard guard(compiling.get());
+	auto [jit, extFuncNames, definedLddwHelpers] =
+		create_and_initialize_lljit_instance();
+	if (!jit) {
+		return llvm::make_error<llvm::StringError>(
+			"jit initialization failed",
+			llvm::inconvertibleErrorCode());
+	}
+	auto bpfModuleOrErr =
+		generateModule(extFuncNames, definedLddwHelpers, true, true,
+				ebpf_func_name);
+	if (!bpfModuleOrErr) {
+		return bpfModuleOrErr.takeError();
+	}
+	auto bpfModule = std::move(*bpfModuleOrErr);
+
+	auto link_err = bpfModule.withModuleDo([&](auto &module) -> llvm::Error {
+		auto buffer = llvm::MemoryBuffer::getMemBufferCopy(
+			llvm::StringRef(
+				reinterpret_cast<const char *>(extra_bitcode.data()),
+				extra_bitcode.size()));
+		auto extraModuleOrErr = llvm::parseBitcodeFile(
+			buffer->getMemBufferRef(), module.getContext());
+		if (!extraModuleOrErr) {
+			return extraModuleOrErr.takeError();
+		}
+		if (llvm::Linker::linkModules(module, std::move(*extraModuleOrErr))) {
+			return llvm::make_error<llvm::StringError>(
+				"Unable to link external bitcode",
+				llvm::inconvertibleErrorCode());
+		}
+		optimizeModule(module);
+		return llvm::Error::success();
+	});
+
+	if (link_err) {
+		return link_err;
+	}
+	if (auto err = jit->addIRModule(std::move(bpfModule))) {
+		return err;
+	}
+	this->jit = std::move(jit);
+	return llvm::Error::success();
+}
+
 llvm_bpf_jit_context::~llvm_bpf_jit_context()
 {
 	pthread_spin_destroy(compiling.get());
@@ -444,44 +489,32 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 	static ExitOnError exitOnErr;
 	// Create a JIT builder
 	SPDLOG_DEBUG("LLVM-JIT: Creating LLJIT instance");
-#ifdef BPFTIME_ENABLE_LLVM_PRELOAD
-	// Preload libLLVM before creating LLJIT so that ORC runtime wrapper symbols
-	// (e.g. llvm_orc_registerEHFrameSectionWrapper) are visible during create.
-	// Allow overriding SONAME via environment variable BPFTIME_LLVM_SONAME.
-	{
-		const char *envSoname = ::getenv("BPFTIME_LLVM_SONAME");
-		const char *candidates[] = {
-			envSoname && envSoname[0] ? envSoname :
-						    (const char *)nullptr,
-			"libLLVM-17.so",
-			"libLLVM.so",
-			"libLLVM-17.0.6.so",
-		};
-		for (const char *name : candidates) {
-			if (!name) {
-				SPDLOG_DEBUG(
-					"LLVM-JIT: skipping empty LLVM SONAME candidate");
-				continue;
-			}
-			auto ok =
-				llvm::sys::DynamicLibrary::LoadLibraryPermanently(
-					name);
-			if (!ok) {
-				SPDLOG_DEBUG(
-					"LLVM-JIT: failed to preload {} for ORC runtime wrappers",
-					name);
-			}
-			if (llvm::sys::DynamicLibrary::
-				    SearchForAddressOfSymbol(
-					    "llvm_orc_registerEHFrameSectionWrapper")) {
-				SPDLOG_DEBUG(
-					"LLVM-JIT: preloaded {} for ORC runtime wrappers",
-					name);
-				break;
-			}
-		}
-	}
-#endif
+    // Preload libLLVM before creating LLJIT so that ORC runtime wrapper symbols
+    // (e.g. llvm_orc_registerEHFrameSectionWrapper) are visible during create.
+    // Allow overriding SONAME via environment variable BPFTIME_LLVM_SONAME.
+    {
+        const char *envSoname = ::getenv("BPFTIME_LLVM_SONAME");
+        const char *candidates[] = {
+            envSoname && envSoname[0] ? envSoname : (const char *)nullptr,
+            "libLLVM-17.so",
+            "libLLVM.so",
+            "libLLVM-17.0.6.so",
+        };
+        for (const char *name : candidates) {
+            if (!name) {
+                SPDLOG_DEBUG("LLVM-JIT: skipping empty LLVM SONAME candidate");
+                continue;
+            }
+            auto ok = llvm::sys::DynamicLibrary::LoadLibraryPermanently(name);
+            if (!ok) {
+                SPDLOG_DEBUG("LLVM-JIT: failed to preload {} for ORC runtime wrappers", name);
+            }
+            if (llvm::sys::DynamicLibrary::SearchForAddressOfSymbol("llvm_orc_registerEHFrameSectionWrapper")) {
+                SPDLOG_DEBUG("LLVM-JIT: preloaded {} for ORC runtime wrappers", name);
+                break;
+            }
+        }
+    }
 	auto jit_err = LLJITBuilder().create();
 	if (!jit_err) {
 		exitOnErr(jit_err.takeError());
@@ -490,9 +523,8 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 	}
 	auto jit = std::move(*jit_err);
 
-#ifdef BPFTIME_ENABLE_LLVM_PRELOAD
 	// Make current process symbols visible to the JIT if supported
-#  if BPFTIME_HAVE_ORC_DYNLIB_SEARCH_GEN
+#if BPFTIME_HAVE_ORC_DYNLIB_SEARCH_GEN
 	{
 		auto &jd = jit->getMainJITDylib();
 		auto gen = llvm::cantFail(
@@ -500,7 +532,7 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 				jit->getDataLayout().getGlobalPrefix()));
 		jd.addGenerator(std::move(gen));
 	}
-#  elif BPFTIME_HAVE_ORC_EXECUTIONUTILS
+#elif BPFTIME_HAVE_ORC_EXECUTIONUTILS
 	{
 		auto &jd = jit->getMainJITDylib();
 		auto gen = llvm::cantFail(
@@ -508,9 +540,8 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 				jit->getDataLayout().getGlobalPrefix()));
 		jd.addGenerator(std::move(gen));
 	}
-#  else
+#else
 	(void)0;
-#  endif
 #endif
 	auto &mainDylib = jit->getMainJITDylib();
 	std::vector<std::string> extFuncNames;
@@ -543,15 +574,9 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 		jit->getExecutionSession().intern("__aeabi_unwind_cpp_pr1"),
 		JITEvaluatedSymbol::fromPointer(__aeabi_unwind_cpp_pr1));
 #endif
-#ifdef BPFTIME_ENABLE_LLVM_PRELOAD
 	if (auto err = mainDylib.define(absoluteSymbols(extSymbols)); err) {
 		SPDLOG_DEBUG("LLVM-JIT: failed to define external symbols");
 	}
-#else
-	if (auto err = mainDylib.define(absoluteSymbols(extSymbols)); !err) {
-		SPDLOG_DEBUG("LLVM-JIT: failed to define external symbols");
-	}
-#endif
 	// Define lddw helpers
 	SymbolMap lddwSyms;
 	std::vector<std::string> definedLddwHelpers;
@@ -588,42 +613,42 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 	// tryDefineLddwHelper(LDDW_HELPER_MAP_BY_IDX, (void *)vm.map_by_idx);
 	// tryDefineLddwHelper(LDDW_HELPER_CODE_ADDR, (void *)vm.code_addr);
 	// tryDefineLddwHelper(LDDW_HELPER_VAR_ADDR, (void *)vm.var_addr);
-#ifdef BPFTIME_ENABLE_LLVM_PRELOAD
+	
 	bool lddwDefinedOK = true;
 	if (auto err = mainDylib.define(absoluteSymbols(lddwSyms)); err) {
-		SPDLOG_DEBUG(
-			"LLVM-JIT: failed to define lddw helpers symbols");
-		lddwDefinedOK = false;
-	}
-	if (!lddwDefinedOK) {
-		definedLddwHelpers.clear();
-	}
-#else
-	if (auto err = mainDylib.define(absoluteSymbols(lddwSyms)); !err) {
-		SPDLOG_DEBUG("LLVM-JIT: failed to define lddw helpers symbols");
-	}
-#endif
+        SPDLOG_DEBUG("LLVM-JIT: failed to define lddw helpers symbols");
+        lddwDefinedOK = false;
+    }
+    if (!lddwDefinedOK) {
+        definedLddwHelpers.clear();
+    }
 	return { std::move(jit), extFuncNames, definedLddwHelpers };
 }
 
-precompiled_ebpf_function llvm_bpf_jit_context::get_entry_address()
+precompiled_ebpf_function llvm_bpf_jit_context::get_entry_address(
+	const std::string &name)
 {
 	if (!this->jit.has_value()) {
 		SPDLOG_ERROR(
 			"Not compiled yet. Unable to get entry func address");
 		throw std::runtime_error("Not compiled yet");
 	}
-	if (auto err = (*jit)->lookup("bpf_main"); !err) {
+	if (auto err = (*jit)->lookup(name); !err) {
 		std::string buf;
 		raw_string_ostream os(buf);
 		os << err.takeError();
-		SPDLOG_ERROR("Unable to find symbol `bpf_main`: {}", buf);
-		throw std::runtime_error("Unable to link symbol `bpf_main`");
+		SPDLOG_ERROR("Unable to find symbol `{}`: {}", name, buf);
+		throw std::runtime_error("Unable to link entry symbol");
 	} else {
 		auto addr = err->toPtr<precompiled_ebpf_function>();
 		SPDLOG_DEBUG("LLVM-JIT: Entry func is {:x}", (uintptr_t)addr);
 		return addr;
 	}
+}
+
+precompiled_ebpf_function llvm_bpf_jit_context::get_entry_address()
+{
+	return get_entry_address("bpf_main");
 }
 
 static std::unique_ptr<llvm::TargetMachine>
