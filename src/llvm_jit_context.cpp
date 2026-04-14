@@ -208,6 +208,20 @@ static llvm::Error set_module_host_layout(llvm::Module &module)
 	return llvm::Error::success();
 }
 
+static llvm::Expected<std::unique_ptr<llvm::TargetMachine>>
+create_host_target_machine()
+{
+	auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+	if (!jtmb) {
+		return jtmb.takeError();
+	}
+	auto tm = jtmb->createTargetMachine();
+	if (!tm) {
+		return tm.takeError();
+	}
+	return std::move(*tm);
+}
+
 struct spin_lock_guard {
 	pthread_spinlock_t *spin;
 	spin_lock_guard(pthread_spinlock_t *spin) : spin(spin)
@@ -263,6 +277,37 @@ static void optimizeModule(llvm::Module &M)
 	PMB.populateModulePassManager(PM);
 
 	PM.run(M);
+#endif
+}
+
+static llvm::Error optimize_agg_module(llvm::Module &M)
+{
+#if LLVM_VERSION_MAJOR >= 17
+	auto tm = create_host_target_machine();
+	if (!tm) {
+		return tm.takeError();
+	}
+
+	LoopAnalysisManager lam;
+	FunctionAnalysisManager fam;
+	CGSCCAnalysisManager cgam;
+	ModuleAnalysisManager mam;
+	PipelineTuningOptions pto;
+	PassBuilder pb(tm->get(), pto);
+
+	pb.registerModuleAnalyses(mam);
+	pb.registerCGSCCAnalyses(cgam);
+	pb.registerFunctionAnalyses(fam);
+	pb.registerLoopAnalyses(lam);
+	pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+	ModulePassManager mpm =
+		pb.buildLTODefaultPipeline(OptimizationLevel::O3, nullptr);
+	mpm.run(M, mam);
+	return llvm::Error::success();
+#else
+	optimizeModule(M);
+	return llvm::Error::success();
 #endif
 }
 
@@ -447,7 +492,9 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile_with_bitcode_modules(
 		return err;
 	}
 	internalize_agg_defs(*module);
-	optimizeModule(*module);
+	if (auto err = optimize_agg_module(*module); err) {
+		return err;
+	}
 	if (auto err = jit->addIRModule(
 		    llvm::orc::ThreadSafeModule(std::move(module),
 					    std::move(context)))) {
