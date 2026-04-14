@@ -76,6 +76,16 @@ class llvmbpf_vm {
 	                              const std::string &entry_symbol,
 	                              const std::string &ebpf_func_symbol = "bpf_main") noexcept;
 
+	// Emit LLVM bitcode for the loaded eBPF program with a custom symbol name
+	std::optional<std::vector<uint8_t>>
+	emit_bitcode(const std::string &func_name) noexcept;
+
+	// Compile a JIT entry from a list of LLVM bitcode modules
+	std::optional<precompiled_ebpf_function>
+	compile_with_bitcode_modules(
+		const std::vector<std::vector<uint8_t>> &bitcode_modules,
+		const std::string &entry_symbol) noexcept;
+
 	// See the spec for details.
 	// If the code involve array map access, the map_val function
 	// needs to be provided.

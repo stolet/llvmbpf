@@ -138,6 +138,46 @@ llvmbpf_vm::compile_with_external_bitcode(
 	}
 }
 
+std::optional<std::vector<uint8_t>>
+llvmbpf_vm::emit_bitcode(const std::string &func_name) noexcept
+{
+	try {
+		return jit_ctx->emit_module_bitcode(func_name);
+	} catch (const std::exception &e) {
+		error_msg = e.what();
+		return {};
+	}
+}
+
+std::optional<bpftime::precompiled_ebpf_function>
+llvmbpf_vm::compile_with_bitcode_modules(
+	const std::vector<std::vector<uint8_t>> &bitcode_modules,
+	const std::string &entry_symbol) noexcept
+{
+	if (jitted_function) {
+		error_msg = "Already compiled";
+		return jitted_function;
+	}
+	try {
+		auto res =
+			jit_ctx->do_jit_compile_with_bitcode_modules(bitcode_modules);
+		if (res) {
+			LLVMErrorRef llvmError = llvm::wrap(std::move(res));
+			error_msg = LLVMGetErrorMessage(llvmError);
+			SPDLOG_ERROR("LLVM-JIT: failed to compile: {}",
+				     error_msg);
+			return {};
+		}
+		auto func = jit_ctx->get_entry_address(entry_symbol);
+		jitted_function = func;
+		return func;
+	} catch (const std::exception &e) {
+		error_msg = e.what();
+		jitted_function = std::nullopt;
+		return {};
+	}
+}
+
 void llvmbpf_vm::set_lddw_helpers(uint64_t (*map_by_fd)(uint32_t),
 				  uint64_t (*map_by_idx)(uint32_t),
 				  uint64_t (*map_val)(uint64_t),

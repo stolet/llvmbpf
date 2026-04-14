@@ -54,20 +54,24 @@ class llvm_bpf_jit_context {
 		   std::vector<std::string>>
 	create_and_initialize_lljit_instance();
 
-    public:
-	std::optional<std::unique_ptr<llvm::orc::LLJIT>> jit;
-	llvm::Error do_jit_compile();
-	llvm_bpf_jit_context(llvmbpf_vm &vm);
-	llvm::Error do_jit_compile_with_external_bitcode(
-	    const std::vector<uint8_t> &extra_bitcode,
-	    const std::string &ebpf_func_name);
-	virtual ~llvm_bpf_jit_context();
-	precompiled_ebpf_function get_entry_address(const std::string &name);
-	precompiled_ebpf_function get_entry_address();
-	std::vector<uint8_t> do_aot_compile(bool print_ir = false);
-	llvm::Error load_aot_object(const std::vector<uint8_t> &buf);
-	std::optional<std::string>
-	generate_ptx(bool main_with_arguments = true,
+	    public:
+		std::optional<std::unique_ptr<llvm::orc::LLJIT>> jit;
+		llvm::Error do_jit_compile();
+		llvm_bpf_jit_context(llvmbpf_vm &vm);
+		llvm::Error do_jit_compile_with_external_bitcode(
+		    const std::vector<uint8_t> &extra_bitcode,
+		    const std::string &ebpf_func_name);
+		llvm::Error do_jit_compile_with_bitcode_modules(
+		    const std::vector<std::vector<uint8_t>> &bitcode_modules);
+		virtual ~llvm_bpf_jit_context();
+		precompiled_ebpf_function get_entry_address(const std::string &name);
+		precompiled_ebpf_function get_entry_address();
+		std::vector<uint8_t> do_aot_compile(bool print_ir = false);
+		std::optional<std::vector<uint8_t>>
+		emit_module_bitcode(const std::string &func_name);
+		llvm::Error load_aot_object(const std::vector<uint8_t> &buf);
+		std::optional<std::string>
+		generate_ptx(bool main_with_arguments = true,
 		     const std::string &func_name = "bpf_main",
 		     const char *target_cpu = "sm_60");
 	std::optional<std::vector<uint8_t>>

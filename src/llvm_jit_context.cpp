@@ -179,6 +179,35 @@ using namespace llvm::orc;
 using namespace bpftime;
 using namespace std;
 
+struct host_layout {
+	std::string triple;
+	llvm::DataLayout dl;
+};
+
+static llvm::Expected<host_layout> get_host_layout()
+{
+	auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+	if (!jtmb) {
+		return jtmb.takeError();
+	}
+	auto dl = jtmb->getDefaultDataLayoutForTarget();
+	if (!dl) {
+		return dl.takeError();
+	}
+	return host_layout { jtmb->getTargetTriple().str(), std::move(*dl) };
+}
+
+static llvm::Error set_module_host_layout(llvm::Module &module)
+{
+	auto host = get_host_layout();
+	if (!host) {
+		return host.takeError();
+	}
+	module.setTargetTriple(host->triple);
+	module.setDataLayout(host->dl);
+	return llvm::Error::success();
+}
+
 struct spin_lock_guard {
 	pthread_spinlock_t *spin;
 	spin_lock_guard(pthread_spinlock_t *spin) : spin(spin)
@@ -279,7 +308,16 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile()
 	// If successful, get the module
 	auto bpfModule = std::move(*bpfModuleOrErr);
 	// Optimize the module
-	bpfModule.withModuleDo([](auto &M) { optimizeModule(M); });
+	auto prep_err = bpfModule.withModuleDo([](auto &M) -> llvm::Error {
+		if (auto err = set_module_host_layout(M); err) {
+			return err;
+		}
+		optimizeModule(M);
+		return llvm::Error::success();
+	});
+	if (prep_err) {
+		return prep_err;
+	}
 	// Handle the error from addIRModule
 	if (auto err = jit->addIRModule(std::move(bpfModule))) {
 		return err;
@@ -309,6 +347,9 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile_with_external_bitcode(
 	auto bpfModule = std::move(*bpfModuleOrErr);
 
 	auto link_err = bpfModule.withModuleDo([&](auto &module) -> llvm::Error {
+		if (auto err = set_module_host_layout(module); err) {
+			return err;
+		}
 		auto buffer = llvm::MemoryBuffer::getMemBufferCopy(
 			llvm::StringRef(
 				reinterpret_cast<const char *>(extra_bitcode.data()),
@@ -317,6 +358,10 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile_with_external_bitcode(
 			buffer->getMemBufferRef(), module.getContext());
 		if (!extraModuleOrErr) {
 			return extraModuleOrErr.takeError();
+		}
+		if (auto err = set_module_host_layout(*extraModuleOrErr->get());
+		    err) {
+			return err;
 		}
 		if (llvm::Linker::linkModules(module, std::move(*extraModuleOrErr))) {
 			return llvm::make_error<llvm::StringError>(
@@ -335,6 +380,97 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile_with_external_bitcode(
 	}
 	this->jit = std::move(jit);
 	return llvm::Error::success();
+}
+
+llvm::Error llvm_bpf_jit_context::do_jit_compile_with_bitcode_modules(
+	const std::vector<std::vector<uint8_t>> &bitcode_modules)
+{
+	spin_lock_guard guard(compiling.get());
+	auto [jit, extFuncNames, definedLddwHelpers] =
+		create_and_initialize_lljit_instance();
+	std::unique_ptr<llvm::LLVMContext> context;
+	std::unique_ptr<llvm::Module> module;
+
+	(void)extFuncNames;
+	(void)definedLddwHelpers;
+	if (!jit) {
+		return llvm::make_error<llvm::StringError>(
+			"jit initialization failed",
+			llvm::inconvertibleErrorCode());
+	}
+	if (bitcode_modules.empty()) {
+		return llvm::make_error<llvm::StringError>(
+			"no bitcode modules provided",
+			llvm::inconvertibleErrorCode());
+	}
+
+	context = std::make_unique<llvm::LLVMContext>();
+	for (const auto &bc : bitcode_modules) {
+		auto buffer = llvm::MemoryBuffer::getMemBufferCopy(
+			llvm::StringRef(
+				reinterpret_cast<const char *>(bc.data()), bc.size()));
+		auto moduleOrErr = llvm::parseBitcodeFile(buffer->getMemBufferRef(),
+							  *context);
+		if (!moduleOrErr) {
+			return moduleOrErr.takeError();
+		}
+		if (auto err = set_module_host_layout(*moduleOrErr->get()); err) {
+			return err;
+		}
+		if (!module) {
+			module = std::move(*moduleOrErr);
+			continue;
+		}
+		if (llvm::Linker::linkModules(*module, std::move(*moduleOrErr))) {
+			return llvm::make_error<llvm::StringError>(
+				"Unable to link bitcode modules",
+				llvm::inconvertibleErrorCode());
+		}
+	}
+
+	if (auto err = set_module_host_layout(*module); err) {
+		return err;
+	}
+	optimizeModule(*module);
+	if (auto err = jit->addIRModule(
+		    llvm::orc::ThreadSafeModule(std::move(module),
+					    std::move(context)))) {
+		return err;
+	}
+	this->jit = std::move(jit);
+	return llvm::Error::success();
+}
+
+std::optional<std::vector<uint8_t>>
+llvm_bpf_jit_context::emit_module_bitcode(const std::string &func_name)
+{
+	auto [jit, extFuncNames, definedLddwHelpers] =
+		create_and_initialize_lljit_instance();
+	std::vector<uint8_t> out;
+	llvm::SmallVector<char, 0> buf;
+
+	(void)jit;
+	auto moduleOrErr =
+		generateModule(extFuncNames, definedLddwHelpers, true, true,
+			       func_name);
+	if (!moduleOrErr) {
+		llvm::consumeError(moduleOrErr.takeError());
+		return {};
+	}
+	auto emit_err = moduleOrErr->withModuleDo([&](auto &module) -> llvm::Error {
+		if (auto err = set_module_host_layout(module); err) {
+			return err;
+		}
+		llvm::raw_svector_ostream os(buf);
+		llvm::WriteBitcodeToFile(module, os);
+		return llvm::Error::success();
+	});
+	if (emit_err) {
+		llvm::consumeError(std::move(emit_err));
+		return {};
+	}
+	out.assign(buf.begin(), buf.end());
+	return out;
 }
 
 llvm_bpf_jit_context::~llvm_bpf_jit_context()
