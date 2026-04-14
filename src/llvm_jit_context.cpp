@@ -266,6 +266,21 @@ static void optimizeModule(llvm::Module &M)
 #endif
 }
 
+static void internalize_agg_defs(llvm::Module &M)
+{
+	for (auto &func : M.functions()) {
+		if (func.isDeclaration()) {
+			continue;
+		}
+		if (func.getName().starts_with("event_rx_slot_") ||
+		    func.getName().starts_with("event_tx_slot_") ||
+		    func.getName().starts_with("event_deq_slot_") ||
+		    func.getName().starts_with("_bpf_helper_ext_")) {
+			func.setLinkage(llvm::GlobalValue::InternalLinkage);
+		}
+	}
+}
+
 #if defined(__arm__) || defined(_M_ARM)
 extern "C" void __aeabi_unwind_cpp_pr1();
 #endif
@@ -431,6 +446,7 @@ llvm::Error llvm_bpf_jit_context::do_jit_compile_with_bitcode_modules(
 	if (auto err = set_module_host_layout(*module); err) {
 		return err;
 	}
+	internalize_agg_defs(*module);
 	optimizeModule(*module);
 	if (auto err = jit->addIRModule(
 		    llvm::orc::ThreadSafeModule(std::move(module),
